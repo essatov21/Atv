@@ -1,0 +1,102 @@
+# Создано Telegram-ботом APK Builder. Не переименовывайте этот файл.
+name: Telegram APK Builder
+run-name: build-${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job id from the Telegram bot"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download job files
+        uses: actions/checkout@v4
+        with:
+          ref: job-${{ inputs.job_id }}
+          path: job
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Unpack project
+        id: cfg
+        run: |
+          set -e
+          mkdir -p project out
+          unzip -q job/project.zip -d project
+          echo "module=$(jq -r .module job/job.json)" >> "$GITHUB_OUTPUT"
+          echo "fmt=$(jq -r .fmt job/job.json)" >> "$GITHUB_OUTPUT"
+          if [ -f project/gradlew ]; then echo "wrapper=true" >> "$GITHUB_OUTPUT"; else echo "wrapper=false" >> "$GITHUB_OUTPUT"; fi
+          KS_PASS=$(jq -r .ks_pass job/job.json)
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+          echo "KS_ALIAS=$(jq -r .ks_alias job/job.json)" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle (project has no wrapper)
+        if: steps.cfg.outputs.wrapper != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build with Gradle
+        working-directory: project
+        env:
+          MODULE: ${{ steps.cfg.outputs.module }}
+          FMT: ${{ steps.cfg.outputs.fmt }}
+        run: |
+          set -e
+          if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+          if [ "$FMT" = "aab" ]; then TASK=bundleRelease; else TASK=assembleRelease; fi
+          if [ "$MODULE" = "." ]; then T="$TASK"; else T=":$(echo "$MODULE" | sed 's#/#:#g'):$TASK"; fi
+          $G "$T" --no-daemon --stacktrace
+
+      - name: Sign
+        env:
+          MODULE: ${{ steps.cfg.outputs.module }}
+          FMT: ${{ steps.cfg.outputs.fmt }}
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          KS="$GITHUB_WORKSPACE/job/keystore.jks"
+          if [ ! -f "$KS" ]; then
+            KS="$GITHUB_WORKSPACE/out/upload-keystore.jks"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass:env KS_PASS -keypass:env KS_PASS -dname "CN=Android App, O=APK Builder"
+          fi
+          if [ "$MODULE" = "." ]; then OUTS=project/build/outputs; else OUTS="project/$MODULE/build/outputs"; fi
+          if [ "$FMT" = "aab" ]; then
+            SRC=$(find "$OUTS/bundle" -name "*.aab" | sort | head -1)
+            [ -n "$SRC" ] || { echo "ERROR: .aab not found"; exit 1; }
+            cp "$SRC" out/app.aab
+            jarsigner -keystore "$KS" -storepass:env KS_PASS -keypass:env KS_PASS \
+              -sigalg SHA256withRSA -digestalg SHA-256 out/app.aab "$KS_ALIAS"
+          else
+            SRC=$(find "$OUTS/apk" -name "*.apk" | sort | head -1)
+            [ -n "$SRC" ] || { echo "ERROR: .apk not found"; exit 1; }
+            "$BT/zipalign" -P 16 -f 4 "$SRC" out/aligned.apk || "$BT/zipalign" -p -f 4 "$SRC" out/aligned.apk
+            "$BT/apksigner" sign --ks "$KS" --ks-pass env:KS_PASS --key-pass env:KS_PASS \
+              --ks-key-alias "$KS_ALIAS" --out out/app.apk out/aligned.apk
+            rm -f out/aligned.apk out/app.apk.idsig
+          fi
+          ls -la out
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
